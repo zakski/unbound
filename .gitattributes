@@ -1,2 +1,12 @@
 testdata/*.[0-9] linguist-documentation
 * text eol=lf
+
+winrc/README.txt binary
+
+*.cmd binary
+*.png binary
+*.ico binary
+*.pdf binary
+*.odp binary
+*.tar.gz binary
+*.url binary
