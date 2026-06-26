@@ -261,25 +261,25 @@ rdata_copy(sldns_buffer* pkt, struct packed_rrset_data* data, uint8_t* to,
 		if(ttl > soa_find_minttl(rr)) ttl = soa_find_minttl(rr);
 		if(!SERVE_ORIGINAL_TTL) {
 			/* If MIN_NEG_TTL is configured skip setting MIN_TTL */
-			if(MIN_NEG_TTL <= 0 && ttl < MIN_TTL) {
-				ttl = MIN_TTL;
+			if(MIN_NEG_TTL <= 0 && ttl < (uint32_t)MIN_TTL) {
+				ttl = (uint32_t)MIN_TTL;
 			}
-			if(ttl > MAX_TTL) ttl = MAX_TTL;
+			if(ttl > (uint32_t)MAX_TTL) ttl = (uint32_t)MAX_TTL;
 		}
 		/* MAX_NEG_TTL overrides the min and max ttl of everything
 		 * else; it is for a more specific record */
-		if(ttl > MAX_NEG_TTL) ttl = MAX_NEG_TTL;
+		if(ttl > (uint32_t)MAX_NEG_TTL) ttl = (uint32_t)MAX_NEG_TTL;
 		/* MIN_NEG_TTL overrides the min and max ttl of everything
 		 * else if configured; it is for a more specific record */
-		if(MIN_NEG_TTL > 0 && ttl < MIN_NEG_TTL) {
-			ttl = MIN_NEG_TTL;
+		if(MIN_NEG_TTL > 0 && ttl < (uint32_t)MIN_NEG_TTL) {
+			ttl = (uint32_t)MIN_NEG_TTL;
 		}
 	} else if(!SERVE_ORIGINAL_TTL) {
-		if(ttl < MIN_TTL) ttl = MIN_TTL;
-		if(ttl > MAX_TTL) ttl = MAX_TTL;
+		if(ttl < (uint32_t)MIN_TTL) ttl = (uint32_t)MIN_TTL;
+		if(ttl > (uint32_t)MAX_TTL) ttl = (uint32_t)MAX_TTL;
 	}
-	if(ttl < data->ttl)
-		data->ttl = ttl;
+	if((time_t)ttl < data->ttl)
+		data->ttl = (time_t)ttl;
 	/* We have concluded the TTL checks */
 	*rr_ttl = (time_t)ttl;
 
@@ -483,9 +483,12 @@ parse_copy_decompress_rrset(sldns_buffer* pkt, struct msg_parse* msg,
 	}
 	pk->entry.data = (void*)data;
 	pk->entry.key = (void*)pk;
-	pk->entry.hash = pset->hash;
-	data->trust = get_rrset_trust(msg, pset);
 	pk->rk.flags |= (data->ttl == 0) ? PACKED_RRSET_UPSTREAM_0TTL : 0;
+	if( (pk->rk.flags & PACKED_RRSET_UPSTREAM_0TTL) != 0)
+		pk->entry.hash = rrset_key_hash(&pk->rk);
+	else
+		pk->entry.hash = pset->hash;
+	data->trust = get_rrset_trust(msg, pset);
 	return 1;
 }
 
@@ -1503,8 +1506,12 @@ struct edns_option* edns_opt_list_find(struct edns_option* list, uint16_t code)
 int local_alias_shallow_copy_qname(struct local_rrset* local_alias, uint8_t** qname,
 	size_t* qname_len)
 {
-	struct ub_packed_rrset_key* rrset = local_alias->rrset;
-	struct packed_rrset_data* d = rrset->entry.data;
+	struct ub_packed_rrset_key* rrset;
+	struct packed_rrset_data* d;
+	rrset = local_alias->rrset;
+	if(!rrset) return 0;
+	d = rrset->entry.data;
+	if(!d) return 0;
 
 	/* Sanity check: our current implementation only supports
 	    * a single CNAME RRset as a local alias. */

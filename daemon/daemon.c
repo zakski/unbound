@@ -215,8 +215,9 @@ setup_listen_sslctx(void** ctx, int is_dot, int is_doh,
 		cfg->tls_ciphers, cfg->tls_ciphersuites,
 		(cfg->tls_session_ticket_keys.first &&
 		cfg->tls_session_ticket_keys.first->str[0] != 0),
-		is_dot, is_doh, cfg->tls_use_system_policy_versions))) {
-		fatal_exit("could not set up listen SSL_CTX");
+		is_dot, is_doh, cfg->tls_protocols))) {
+		log_err("could not set up listen SSL_CTX");
+		*ctx = NULL;
 	}
 }
 #endif /* HAVE_SSL */
@@ -258,7 +259,8 @@ void* daemon_setup_listen_quic_sslctx(struct daemon* daemon,
 		pem += strlen(chroot);
 
 	if(!(ctx = quic_sslctx_create(key, pem, NULL))) {
-		fatal_exit("could not set up quic SSL_CTX");
+		log_err("could not set up quic SSL_CTX");
+		return NULL;
 	}
 	return ctx;
 }
@@ -276,8 +278,10 @@ void* daemon_setup_connect_dot_sslctx(struct daemon* daemon,
 		bundle += strlen(chroot);
 
 	if(!(ctx = connect_sslctx_create(NULL, NULL, bundle,
-		cfg->tls_win_cert)))
-		fatal_exit("could not set up connect SSL_CTX");
+		cfg->tls_win_cert))) {
+		log_err("could not set up connect SSL_CTX");
+		return NULL;
+	}
 	return ctx;
 }
 #endif /* HAVE_SSL */
@@ -307,16 +311,22 @@ daemon_setup_sslctxs(struct daemon* daemon, struct config_file* cfg)
 		}
 		daemon->listen_dot_sslctx = daemon_setup_listen_dot_sslctx(
 			daemon, cfg);
+		if(!daemon->listen_dot_sslctx)
+			fatal_exit("Could not set up listen dot sslctx");
 #ifdef HAVE_NGHTTP2_NGHTTP2_H
 		if(cfg_has_https(cfg)) {
 			daemon->listen_doh_sslctx =
 				daemon_setup_listen_doh_sslctx(daemon, cfg);
+			if(!daemon->listen_doh_sslctx)
+				fatal_exit("Could not set up listen doh sslctx");
 		}
 #endif
 #ifdef HAVE_NGTCP2
 		if(cfg_has_quic(cfg)) {
 			daemon->listen_quic_sslctx =
 				daemon_setup_listen_quic_sslctx(daemon, cfg);
+			if(!daemon->listen_quic_sslctx)
+				fatal_exit("Could not set up listen quic sslctx");
 		}
 #endif /* HAVE_NGTCP2 */
 
@@ -324,22 +334,33 @@ daemon_setup_sslctxs(struct daemon* daemon, struct config_file* cfg)
 		daemon->ssl_service_key = strdup(cfg->ssl_service_key);
 		if(!daemon->ssl_service_key)
 			fatal_exit("could not setup ssl ctx: out of memory");
-		daemon->ssl_service_pem = strdup(cfg->ssl_service_pem);
-		if(!daemon->ssl_service_pem)
-			fatal_exit("could not setup ssl ctx: out of memory");
+		if(cfg->ssl_service_pem) {
+			daemon->ssl_service_pem = strdup(cfg->ssl_service_pem);
+			if(!daemon->ssl_service_pem)
+				fatal_exit("could not setup ssl ctx: out of memory");
+		} else {
+			daemon->ssl_service_pem = NULL;
+		}
 		if(!file_get_mtime(key,
 			&daemon->mtime_ssl_service_key,
 			&daemon->mtime_ns_ssl_service_key, NULL))
 			log_err("Could not stat(%s): %s",
 				key, strerror(errno));
-		if(!file_get_mtime(pem,
-			&daemon->mtime_ssl_service_pem,
-			&daemon->mtime_ns_ssl_service_pem, NULL))
-			log_err("Could not stat(%s): %s",
-				pem, strerror(errno));
+		if(pem) {
+			if(!file_get_mtime(pem,
+				&daemon->mtime_ssl_service_pem,
+				&daemon->mtime_ns_ssl_service_pem, NULL))
+				log_err("Could not stat(%s): %s",
+					pem, strerror(errno));
+		} else {
+			daemon->mtime_ssl_service_pem = 0;
+			daemon->mtime_ns_ssl_service_pem = 0;
+		}
 	}
 	daemon->connect_dot_sslctx = daemon_setup_connect_dot_sslctx(
 		daemon, cfg);
+	if(!daemon->connect_dot_sslctx)
+		fatal_exit("could not setup connect dot sslctx");
 #else /* HAVE_SSL */
 	(void)daemon;(void)cfg;
 #endif /* HAVE_SSL */
@@ -399,16 +420,18 @@ ssl_cert_changed(struct daemon* daemon, struct config_file* cfg)
 	if(mtime != daemon->mtime_ssl_service_key ||
 		ns != daemon->mtime_ns_ssl_service_key)
 		return 1;
-	if(!file_get_mtime(pem, &mtime, &ns, NULL)) {
-		log_err("Could not stat(%s): %s",
-			pem, strerror(errno));
-		/* It has probably changed, but file read is likely going to
-		 * fail. */
-		return 0;
+	if(pem) {
+		if(!file_get_mtime(pem, &mtime, &ns, NULL)) {
+			log_err("Could not stat(%s): %s",
+				pem, strerror(errno));
+			/* It has probably changed, but file read is likely going to
+			 * fail. */
+			return 0;
+		}
+		if(mtime != daemon->mtime_ssl_service_pem ||
+			ns != daemon->mtime_ns_ssl_service_pem)
+			return 1;
 	}
-	if(mtime != daemon->mtime_ssl_service_pem ||
-		ns != daemon->mtime_ns_ssl_service_pem)
-		return 1;
 	return 0;
 }
 
@@ -909,6 +932,14 @@ thread_start(void* arg)
 	struct worker* worker = (struct worker*)arg;
 	int port_num = 0;
 	set_log_thread_id(worker, worker->daemon->cfg);
+	{
+		char name[16]; /* seems to be the safest size between
+				  different OSes */
+		snprintf(name, sizeof(name), "unbound/%u", worker->thread_num);
+		/* worker->thr_id can be written to after the thread was made
+		 * by the creating thread, so this uses pthread_self. */
+		ub_thread_setname(ub_thread_self(), name);
+	}
 	ub_thread_blocksigs();
 #ifdef THREADS_DISABLED
 	/* close pipe ends used by main */
@@ -922,8 +953,9 @@ thread_start(void* arg)
 		port_num = 0;
 #endif
 	if(!worker_init(worker, worker->daemon->cfg,
-			worker->daemon->ports[port_num], 0))
+			worker->daemon->ports[port_num], 0)) {
 		fatal_exit("Could not initialize thread");
+	}
 
 	worker_work(worker);
 	return NULL;
@@ -1076,11 +1108,18 @@ daemon_fork(struct daemon* daemon)
 	 * the thread_start() procedure.
 	 */
 	set_log_thread_id(daemon->workers[0], daemon->cfg);
+	/* If shm stats need an offset, calculate it */
+	if(daemon->cfg->shm_enable && daemon->cfg->stat_interval > 0) {
+		daemon->stat_time_specific = 1;
+		daemon->stat_time_offset =
+			((int)time(NULL))%daemon->cfg->stat_interval;
+	}
 
 #if defined(HAVE_EV_LOOP) || defined(HAVE_EV_DEFAULT_LOOP)
 	/* in libev the first inited base gets signals */
-	if(!worker_init(daemon->workers[0], daemon->cfg, daemon->ports[0], 1))
+	if(!worker_init(daemon->workers[0], daemon->cfg, daemon->ports[0], 1)) {
 		fatal_exit("Could not initialize main thread");
+	}
 #endif
 	
 	/* Now create the threads and init the workers.
@@ -1093,8 +1132,9 @@ daemon_fork(struct daemon* daemon)
 	 */
 #if !(defined(HAVE_EV_LOOP) || defined(HAVE_EV_DEFAULT_LOOP))
 	/* libevent has the last inited base get signals (or any base) */
-	if(!worker_init(daemon->workers[0], daemon->cfg, daemon->ports[0], 1))
+	if(!worker_init(daemon->workers[0], daemon->cfg, daemon->ports[0], 1)) {
 		fatal_exit("Could not initialize main thread");
+	}
 #endif
 	signal_handling_playback(daemon->workers[0]);
 
@@ -1138,7 +1178,6 @@ daemon_cleanup(struct daemon* daemon)
 	/* before stopping main worker, handle signals ourselves, so we
 	   don't die on multiple reload signals for example. */
 	signal_handling_record();
-	log_thread_set(NULL);
 	/* clean up caches because
 	 * a) RRset IDs will be recycled after a reload, causing collisions
 	 * b) validation config can change, thus rrset, msg, keycache clear
@@ -1242,7 +1281,7 @@ daemon_delete(struct daemon* daemon)
 #  if HAVE_DECL_SSL_COMP_GET_COMPRESSION_METHODS && HAVE_DECL_SK_SSL_COMP_POP_FREE
 #    ifndef S_SPLINT_S
 #      if OPENSSL_VERSION_NUMBER < 0x10100000
-	sk_SSL_COMP_pop_free(comp_meth, (void(*)())CRYPTO_free);
+	sk_SSL_COMP_pop_free(comp_meth, (void(*)(SSL_COMP*))CRYPTO_free);
 #      endif
 #    endif
 #  endif

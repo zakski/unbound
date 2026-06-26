@@ -160,6 +160,19 @@ reuse_cmp_addrportssl(const void* key1, const void* key2)
 		return 1;
 	if(!r1->is_ssl && r2->is_ssl)
 		return -1;
+
+	/* compare tls_auth_name if SSL-enabled */
+	if(r1->is_ssl) {
+		if(r1->tls_auth_name && !r2->tls_auth_name)
+			return 1;
+		if(!r1->tls_auth_name && r2->tls_auth_name)
+			return -1;
+		if(r1->tls_auth_name && r2->tls_auth_name) {
+			r = strcmp(r1->tls_auth_name, r2->tls_auth_name);
+			if(r != 0)
+				return r;
+		}
+	}
 	return 0;
 }
 
@@ -531,7 +544,7 @@ reuse_tcp_insert(struct outside_network* outnet, struct pending_tcp* pend_tcp)
 /** find reuse tcp stream to destination for query, or NULL if none */
 static struct reuse_tcp*
 reuse_tcp_find(struct outside_network* outnet, struct sockaddr_storage* addr,
-	socklen_t addrlen, int use_ssl)
+	socklen_t addrlen, int use_ssl, char* tls_auth_name)
 {
 	struct waiting_tcp key_w;
 	struct pending_tcp key_p;
@@ -545,8 +558,10 @@ reuse_tcp_find(struct outside_network* outnet, struct sockaddr_storage* addr,
 	key_p.c = &c;
 	key_p.reuse.pending = &key_p;
 	key_p.reuse.node.key = &key_p.reuse;
-	if(use_ssl)
+	if(use_ssl) {
 		key_p.reuse.is_ssl = 1;
+		key_p.reuse.tls_auth_name = tls_auth_name;
+	}
 	if(addrlen > (socklen_t)sizeof(key_p.reuse.addr))
 		return NULL;
 	memmove(&key_p.reuse.addr, addr, addrlen);
@@ -646,6 +661,7 @@ static int
 outnet_tcp_take_into_use(struct waiting_tcp* w)
 {
 	struct pending_tcp* pend = w->outnet->tcp_free;
+	char* tls_auth_name = NULL;
 	int s;
 	log_assert(pend);
 	log_assert(w->pkt);
@@ -746,7 +762,22 @@ outnet_tcp_take_into_use(struct waiting_tcp* w)
 		comm_point_tcp_win_bio_cb(pend->c, pend->c->ssl);
 #endif
 		pend->c->ssl_shake_state = comm_ssl_shake_write;
-		if(!set_auth_name_on_ssl(pend->c->ssl, w->tls_auth_name,
+		if(w->tls_auth_name) {
+			/* strdup the auth name, while not linked the list yet,
+			 * in case of failure, easy cleanup. */
+			tls_auth_name = strdup(w->tls_auth_name);
+			if(!tls_auth_name) {
+				log_err("out of memory: alloc tls auth name");
+				pend->c->fd = s;
+#ifdef HAVE_SSL
+				SSL_free(pend->c->ssl);
+#endif
+				pend->c->ssl = NULL;
+				comm_point_close(pend->c);
+				return 0;
+			}
+		}
+		if(!set_auth_name_on_ssl(pend->c->ssl, tls_auth_name,
 			w->outnet->tls_use_sni)) {
 			pend->c->fd = s;
 #ifdef HAVE_SSL
@@ -754,6 +785,7 @@ outnet_tcp_take_into_use(struct waiting_tcp* w)
 #endif
 			pend->c->ssl = NULL;
 			comm_point_close(pend->c);
+			free(tls_auth_name);
 			return 0;
 		}
 	}
@@ -778,9 +810,20 @@ outnet_tcp_take_into_use(struct waiting_tcp* w)
 	if(pend->reuse.node.key)
 		reuse_tcp_remove_tree_list(w->outnet, &pend->reuse);
 
-	if(pend->c->ssl)
+	if(pend->c->ssl) {
 		pend->reuse.is_ssl = 1;
-	else	pend->reuse.is_ssl = 0;
+		if(pend->reuse.tls_auth_name)
+			free(pend->reuse.tls_auth_name);
+		pend->reuse.tls_auth_name = tls_auth_name;
+		tls_auth_name = NULL;
+	} else {
+		pend->reuse.is_ssl = 0;
+		if(pend->reuse.tls_auth_name)
+			free(pend->reuse.tls_auth_name);
+		pend->reuse.tls_auth_name = NULL;
+	}
+	/* free tls auth name if nonNULL */
+	free(tls_auth_name);
 	/* insert in reuse by address tree if not already inserted there */
 	(void)reuse_tcp_insert(w->outnet, pend);
 	reuse_tree_by_id_insert(&pend->reuse, w);
@@ -969,7 +1012,7 @@ use_free_buffer(struct outside_network* outnet)
 			(!outnet->tcp_reuse_first && !outnet->tcp_reuse_last) ||
 			(outnet->tcp_reuse_first && outnet->tcp_reuse_last));
 		reuse = reuse_tcp_find(outnet, &w->addr, w->addrlen,
-			w->ssl_upstream);
+			w->ssl_upstream, w->tls_auth_name);
 		/* re-select an ID when moving to a new TCP buffer */
 		w->id = tcp_select_id(outnet, reuse);
 		LDNS_ID_SET(w->pkt, w->id);
@@ -1197,6 +1240,10 @@ decommission_pending_tcp(struct outside_network* outnet,
 	if(pend->reuse.node.key) {
 		/* needs unlink from the reuse tree to get deleted */
 		reuse_tcp_remove_tree_list(outnet, &pend->reuse);
+	}
+	if(pend->reuse.tls_auth_name) {
+		free(pend->reuse.tls_auth_name);
+		pend->reuse.tls_auth_name = NULL;
 	}
 	/* free SSL structure after remove from outnet tcp reuse tree,
 	 * because the c->ssl null or not is used for sorting in the tree */
@@ -1660,6 +1707,12 @@ static int setup_if(struct port_if* pif, const char* addrstr,
 	   !netblockstrtoaddr(addrstr, UNBOUND_DNS_PORT,
 			      &pif->addr, &pif->addrlen, &pif->pfxlen))
 		return 0;
+#ifdef INT_MAX
+	if(numfd > (size_t)INT_MAX) {
+		log_err("num_ports exceeds INT_MAX");
+		return 0;
+	}
+#endif
 	pif->maxout = (int)numfd;
 	pif->inuse = 0;
 	pif->out = (struct port_comm**)calloc(numfd, 
@@ -1728,6 +1781,13 @@ outside_network_create(struct comm_base *base, size_t bufsize,
 		outside_network_delete(outnet);
 		return NULL;
 	}
+#ifdef INT_MAX
+	if(num_ports > (size_t)INT_MAX) {
+		log_err("outgoing num_ports exceeds INT_MAX");
+		outside_network_delete(outnet);
+		return NULL;
+	}
+#endif
 #ifndef INET6
 	do_ip6 = 0;
 #endif
@@ -1921,6 +1981,10 @@ outside_network_delete(struct outside_network* outnet)
 					/* delete waiting_tcp elements that
 					 * the tcp conn is working on */
 					decommission_pending_tcp(outnet, pend);
+				}
+				if(pend->reuse.tls_auth_name) {
+					free(pend->reuse.tls_auth_name);
+					pend->reuse.tls_auth_name = NULL;
 				}
 				comm_point_delete(outnet->tcp_conns[i]->c);
 				free(outnet->tcp_conns[i]);
@@ -2447,7 +2511,7 @@ pending_tcp_query(struct serviced_query* sq, sldns_buffer* packet,
 	/* find out if a reused stream to the target exists */
 	/* if so, take it into use */
 	reuse = reuse_tcp_find(sq->outnet, &sq->addr, sq->addrlen,
-		sq->ssl_upstream);
+		sq->ssl_upstream, sq->tls_auth_name);
 	if(reuse) {
 		log_reuse_tcp(VERB_CLIENT, "pending_tcp_query: found reuse", reuse);
 		log_assert(reuse->pending);
@@ -3287,9 +3351,9 @@ serviced_udp_callback(struct comm_point* c, void* arg, int error,
 	if(error == NETEVENT_TIMEOUT) {
 		if(sq->status == serviced_query_UDP_EDNS && sq->last_rtt < 5000 &&
 		   (serviced_query_udp_size(sq, serviced_query_UDP_EDNS_FRAG) < serviced_query_udp_size(sq, serviced_query_UDP_EDNS))) {
-			/* fallback to 1480/1280 */
+			/* fallback to 1472/1232 */
 			sq->status = serviced_query_UDP_EDNS_FRAG;
-			log_name_addr(VERB_ALGO, "try edns1xx0", sq->qbuf+10,
+			log_name_addr(VERB_ALGO, "try edns1xx2", sq->qbuf+10,
 				&sq->addr, sq->addrlen);
 			if(!serviced_udp_send(sq, c->buffer)) {
 				serviced_callbacks(sq, NETEVENT_CLOSED, c, rep);
@@ -3426,7 +3490,8 @@ outnet_serviced_query(struct outside_network* outnet,
 	char* tls_auth_name, struct sockaddr_storage* addr, socklen_t addrlen,
 	uint8_t* zone, size_t zonelen, struct module_qstate* qstate,
 	comm_point_callback_type* callback, void* callback_arg,
-	sldns_buffer* buff, struct module_env* env, int* was_ratelimited)
+	sldns_buffer* buff, struct module_env* env, int* was_ratelimited,
+	int* ratelimit_incremented)
 {
 	struct serviced_query* sq;
 	struct service_callback* cb;
@@ -3498,6 +3563,7 @@ outnet_serviced_query(struct outside_network* outnet,
 					"delegation point", zone,
 					LDNS_RR_TYPE_NS, LDNS_RR_CLASS_IN);
 			}
+			*ratelimit_incremented = 1;
 		}
 		/* make new serviced query entry */
 		sq = serviced_create(outnet, buff, dnssec, want_dnssec, nocaps,
@@ -3690,7 +3756,33 @@ setup_comm_ssl(struct comm_point* cp, struct outside_network* outnet,
 		(void)SSL_set_tlsext_host_name(cp->ssl, host);
 	}
 #endif
-#ifdef HAVE_SSL_SET1_HOST
+#ifdef HAVE_SSL_SET1_DNSNAME
+	if((SSL_CTX_get_verify_mode(outnet->sslctx)&SSL_VERIFY_PEER)) {
+		/* because we set SSL_VERIFY_PEER, in netevent in
+		 * ssl_handshake, it'll check if the certificate
+		 * verification has succeeded */
+		/* SSL_VERIFY_PEER is set on the sslctx */
+		/* and the certificates to verify with are loaded into
+		 * it with SSL_load_verify_locations or
+		 * SSL_CTX_set_default_verify_paths */
+		/* setting the hostname makes openssl verify the
+		 * host name in the x509 certificate in the
+		 * SSL connection*/
+		struct sockaddr_storage tmpaddr;
+		socklen_t tmpaddrlen = (socklen_t)sizeof(tmpaddr);
+		if(ipstrtoaddr(host, UNBOUND_DNS_PORT, &tmpaddr, &tmpaddrlen)) {
+			if(!SSL_set1_ipaddr(cp->ssl, host)) {
+				log_err("SSL_set1_ipaddr failed");
+				return 0;
+			}
+		} else {
+			if(!SSL_set1_dnsname(cp->ssl, host)) {
+				log_err("SSL_set1_dnsname failed");
+				return 0;
+			}
+		}
+	}
+#elif defined(HAVE_SSL_SET1_HOST)
 	if((SSL_CTX_get_verify_mode(outnet->sslctx)&SSL_VERIFY_PEER)) {
 		/* because we set SSL_VERIFY_PEER, in netevent in
 		 * ssl_handshake, it'll check if the certificate
@@ -3819,7 +3911,8 @@ outnet_comm_point_for_http(struct outside_network* outnet,
 		/* outnet_tcp_connect has closed fd on error for us */
 		return 0;
 	}
-	cp = comm_point_create_http_out(outnet->base, 65552, cb, cb_arg,
+	cp = comm_point_create_http_out(outnet->base,
+		sldns_buffer_capacity(outnet->udp_buff), cb, cb_arg,
 		outnet->udp_buff);
 	if(!cp) {
 		log_err("malloc failure");

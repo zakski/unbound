@@ -1066,15 +1066,32 @@ val_fill_reply(struct reply_info* chase, struct reply_info* orig,
 			if(query_dname_compare(name, 
 				orig->rrsets[i]->rk.dname) == 0)
 			    chase->rrsets[chase->an_numrrsets
-				+orig->ns_numrrsets+chase->ar_numrrsets++] 
+				+chase->ns_numrrsets+chase->ar_numrrsets++]
 				= orig->rrsets[i];
 		} else if(rrset_has_signer(orig->rrsets[i], name, len)) {
-			chase->rrsets[chase->an_numrrsets+orig->ns_numrrsets+
+			chase->rrsets[chase->an_numrrsets+chase->ns_numrrsets+
 				chase->ar_numrrsets++] = orig->rrsets[i];
 		}
 	}
 	chase->rrset_count = chase->an_numrrsets + chase->ns_numrrsets + 
 		chase->ar_numrrsets;
+}
+
+void val_reply_remove_answers(struct reply_info* rep, size_t index,
+	size_t count)
+{
+	log_assert(index < rep->rrset_count);
+	log_assert(index < rep->an_numrrsets);
+	if(count == 0)
+		return; /* nothing to do */
+	log_assert(index+(count-1) < rep->rrset_count);
+	log_assert(index+(count-1) < rep->an_numrrsets);
+	if(rep->rrset_count - (count-1) - index - 1 > 0)
+	  memmove(rep->rrsets+index, rep->rrsets+index+(count-1)+1,
+		sizeof(struct ub_packed_rrset_key*)*
+		(rep->rrset_count - (count-1) - index - 1));
+	rep->an_numrrsets -= count;
+	rep->rrset_count -= count;
 }
 
 void val_reply_remove_auth(struct reply_info* rep, size_t index)
@@ -1310,10 +1327,11 @@ val_find_DS(struct module_env* env, uint8_t* nm, size_t nmlen, uint16_t c,
 		/* DS rrset exists. Return it to the validator immediately*/
 		struct ub_packed_rrset_key* copy = packed_rrset_copy_region(
 			rrset, region, *env->now);
-		struct packed_rrset_data* d = copy->entry.data;
+		struct packed_rrset_data* d;
 		lock_rw_unlock(&rrset->entry.lock);
 		if(!copy)
 			return NULL;
+		d = (struct packed_rrset_data*)copy->entry.data;
 		msg = dns_msg_create(nm, nmlen, LDNS_RR_TYPE_DS, c, region, 1);
 		if(!msg)
 			return NULL;
@@ -1333,4 +1351,27 @@ val_find_DS(struct module_env* env, uint8_t* nm, size_t nmlen, uint16_t c,
 	msg = val_neg_getmsg(env->neg_cache, &qinfo, region, env->rrset_cache,
 		env->scratch_buffer, *env->now, 0, topname, env->cfg);
 	return msg;
+}
+
+int derive_cname_from_dname(struct ub_packed_rrset_key* cname,
+	struct ub_packed_rrset_key* dname, uint8_t* out, size_t outlen)
+{
+	size_t prefix_len;
+	uint8_t* dname_target = NULL;
+	size_t dname_target_len = 0;
+	if(!dname_strict_subdomain_c(cname->rk.dname, dname->rk.dname))
+		return 0; /* Invalid: CNAME owner must be subdomain */
+	get_cname_target(dname, &dname_target, &dname_target_len);
+	if(!dname_target || !dname_target_len)
+		return 0; /* DNAME malformed */
+	if(cname->rk.dname_len < dname->rk.dname_len)
+		return 0; /* Not possible, due to subdomain, but check */
+	if(cname->rk.dname_len == 0)
+		return 0; /* Not possible, but check */
+	prefix_len = cname->rk.dname_len - dname->rk.dname_len;
+	if(prefix_len + dname_target_len > outlen)
+		return 0; /* Buffer too small */
+	memmove(out, cname->rk.dname, prefix_len);
+	memmove(out+prefix_len, dname_target, dname_target_len);
+	return 1;
 }

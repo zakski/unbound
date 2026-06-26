@@ -642,7 +642,7 @@ These options are part of the ``server:`` section.
 
 @@UAHL@unbound.conf@so-sndbuf@@: *<number>*
     If not 0, then set the SO_SNDBUF socket option to get more buffer space on
-    UDP port 53 outgoing queries.
+    UDP port 53 outgoing responses.
     This for very busy servers handles spikes in answer traffic, otherwise:
 
     .. code-block:: text
@@ -1180,28 +1180,19 @@ These options are part of the ``server:`` section.
 @@UAHL@unbound.conf@tls-use-sni@@: *<yes or no>*
     Enable or disable sending the SNI extension on TLS connections.
 
-    .. note:: Changing the value requires a reload.
+    .. note:: Changing the value requires a restart.
 
     Default: yes
 
 
-@@UAHL@unbound.conf@tls-use-system-policy-versions@@: *<yes or no>*
-    Enable or disable general-purpose version-flexible TLS server configuration
-    when serving TLS.
-    This will allow the whole list of available TLS versions provided by the
-    crypto library, which may have been further restricted by the system's
-    crypto policy.
+@@UAHL@unbound.conf@tls-protocols@@: *"<list of protocols>"*
+    Specify the allowed TLS protocol versions to use, in no particular order.
+    Possible values are ``TLSv1.2`` and ``TLSv1.3``.
+    Enclose list of protocols in quotes (``""``) and put spaces between them.
 
-    If disabled Unbound only uses the latest available TLS version.
+    .. note:: Changing the value requires a restart.
 
-    The default depends on a compilation choice, it is set
-    at @SYSTEM_TLS_DEFAULT@ .
-
-    .. caution:: Use only if you want to support legacy TLS client connections.
-
-    .. note:: Changing the value requires a reload.
-
-    Default: @SYSTEM_TLS_DEFAULT@
+    Default: "TLSv1.2 TLSv1.3"
 
 
 @@UAHL@unbound.conf@pad-responses@@: *<yes or no>*
@@ -2109,6 +2100,8 @@ These options are part of the ``server:`` section.
     If disabled, Unbound responds with a short list of resource records if some
     can be found in the cache and makes the upstream type ANY query if there
     are none.
+    The option stops the DNSSEC validation from processing, possibly lengthy,
+    ANY responses, when the option is enabled.
 
     Default: no
 
@@ -3087,6 +3080,18 @@ These options are part of the ``server:`` section.
     overloaded with random names, and keeps unbound from sending traffic to the
     nameservers for those zones.
 
+    It is intended to count the number of queries towards the nameservers
+    for the zone, and keep those queries limited.
+    When there is a delegation that needs a lot of lookups, those are
+    charged in the counters for the destination, the target name, of
+    the NS records.
+    Since that is where the nameserver lookup queries are sent to.
+    That keeps the target, the victim domain, from having many queries.
+    With the :ref:`ratelimit-factor<unbound.conf.ratelimit-factor>`, some
+    genuine queries that are also made to the target zone, can filter
+    through, and then end up in cache, where the genuine answers have
+    a chance to collect, keeping up service to some extent.
+
     .. note:: Configured forwarders are excluded from ratelimiting.
 
     Default: 0
@@ -3269,6 +3274,10 @@ These options are part of the ``server:`` section.
     Hard limit on the number of times Unbound is allowed to restart a query
     upon encountering a CNAME record.
     Results in SERVFAIL when reached.
+    This applies to chained CNAME records but not sporadic CNAME records that
+    could be encountered in the lifetime of the query's resolution effort.
+    When a CNAME chain concludes, the counter keeping track of this limit is
+    reset.
     Changing this value needs caution as it can allow long CNAME chains to be
     accepted, where Unbound needs to verify (resolve) each link individually.
 
@@ -3291,6 +3300,15 @@ These options are part of the ``server:`` section.
     Clips off the remainder of the reply packet at that point.
 
     Default: 11
+
+
+@@UAHL@unbound.conf@iter-scrub-rrsig@@: *<number>*
+    Limit on the number of RRSIGs allowed for an RRset, from the iterator
+    scrubber.
+    This protects against an overly large number of RRSIGs.
+    Clips off the remainder of the RRSIG list at that point.
+
+    Default: 8
 
 
 @@UAHL@unbound.conf@max-global-quota@@: *<number>*
@@ -4006,6 +4024,31 @@ fallback activates to fetch from the upstream instead of the SERVFAIL.
     If not given then no zonefile is used.
     If the file does not exist or is empty, Unbound will attempt to fetch zone
     data (eg. from the primary servers).
+
+
+@@UAHL@unbound.conf.auth@max-transfer-size@@: *<number>*
+    Number of bytes size of the maximum zone transfer size.
+    Larger transfers, over AXFR, IXFR and HTTP, are not allowed.
+    A plain number is in bytes, append 'k', 'm' or 'g' for kilobytes, megabytes
+    or gigabytes (1024*1024 bytes in a megabyte).
+    The value ``0`` disables the feature.
+
+    Only consider for untrusted/misbehaving primaries that could hog resources
+    and bring down the resolver.
+
+    Default: 0
+
+
+@@UAHL@unbound.conf.auth@max-transfer-time@@: *<msec>*
+    Maximum time in milliseconds that a zone transfer is allowed to take from
+    the start.
+    The value ``0`` disables the feature.
+
+    Only consider for untrusted/misbehaving primaries that could hog resources
+    and bring down the resolver.
+
+    Default: 0
+
 
 .. _unbound.conf.view:
 
@@ -5087,6 +5130,10 @@ answer queries with that content.
     because it may not have that when retrieving that data, instead use a plain
     IP address to avoid a circular dependency on retrieving that IP address.
 
+    Every number of IXFR transfers, a full AXFR is performed.
+    This is to consolidate the rpz memory, that would otherwise grow.
+    The fixed value is after 5 IXFR transfers.
+
 
 @@UAHL@unbound.conf.rpz@master@@: *<IP address or host name>*
     Alternate syntax for :ref:`primary<unbound.conf.rpz.primary>`.
@@ -5186,6 +5233,31 @@ answer queries with that content.
 
     If no tags are specified the policies from this section will be applied for
     all clients.
+
+
+@@UAHL@unbound.conf.rpz@max-transfer-size@@: *<number>*
+    Number of bytes size of the maximum zone transfer size.
+    Larger transfers, over AXFR, IXFR and HTTP, are not allowed.
+    A plain number is in bytes, append 'k', 'm' or 'g' for kilobytes, megabytes
+    or gigabytes (1024*1024 bytes in a megabyte).
+    The value ``0`` disables the feature.
+
+    Only consider for untrusted/misbehaving primaries that could hog resources
+    and bring down the resolver.
+
+    Default: 0
+
+
+@@UAHL@unbound.conf.rpz@max-transfer-time@@: *<msec>*
+    Maximum time in milliseconds that a zone transfer is allowed to take from
+    the start.
+    The value ``0`` disables the feature.
+
+    Only consider for untrusted/misbehaving primaries that could hog resources
+    and bring down the resolver.
+
+    Default: 0
+
 
 Memory Control Example
 ----------------------

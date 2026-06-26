@@ -62,6 +62,13 @@
 #include "sldns/rrdef.h"
 #include "sldns/sbuffer.h"
 
+/**
+ * The maximum salt length that the negative cache is willing to use.
+ * Larger salt increases the computation time, while recommendations are
+ * for zero salt length for zones.
+ */
+#define MAX_SALT_LENGTH 64
+
 int val_neg_data_compare(const void* a, const void* b)
 {
 	struct val_neg_data* x = (struct val_neg_data*)a;
@@ -826,7 +833,11 @@ void neg_insert_data(struct val_neg_cache* neg,
 			(slen != 0 && zone->nsec3_salt && s
 			  && memcmp(zone->nsec3_salt, s, slen) != 0))) {
 
-			if(slen > 0) {
+			if(slen > MAX_SALT_LENGTH) {
+				/* RFC 9276 s3.1: operators SHOULD NOT use a salt; large
+				 * salts inflate per-hash block count. Decline to cache. */
+				return;
+			} else if(slen > 0) {
 				uint8_t* sa = memdup(s, slen);
 				if(sa) {
 					free(zone->nsec3_salt);
@@ -1165,6 +1176,15 @@ neg_find_nsec3_ce(struct val_neg_zone* zone, uint8_t* qname, size_t qname_len,
 	uint8_t hashce[NSEC3_SHA_LEN];
 	uint8_t b32[257];
 	size_t celen, b32len;
+	int hashmax = MAX_NSEC3_CALCULATIONS;
+	if(qlabs > hashmax) {
+		/* strip leading labels so the walk costs at most
+		 * MAX_NSEC3_CALCULATIONS hashes, mirroring val_nsec3.c */
+		while(qlabs > hashmax) {
+			dname_remove_label(&qname, &qname_len);
+			qlabs--;
+		}
+	}
 
 	*nclen = 0;
 	while(qlabs > 0) {
@@ -1203,8 +1223,8 @@ neg_params_ok(struct val_neg_zone* zone, struct ub_packed_rrset_key* rrset)
 		return 0;
 	return (h == zone->nsec3_hash && it == zone->nsec3_iter &&
 		slen == zone->nsec3_saltlen &&
-		(slen != 0 && zone->nsec3_salt && s
-		  && memcmp(zone->nsec3_salt, s, slen) == 0));
+		(slen == 0 || (slen != 0 && zone->nsec3_salt && s
+		  && memcmp(zone->nsec3_salt, s, slen) == 0)));
 }
 
 /** get next closer for nsec3 proof */
@@ -1265,6 +1285,12 @@ neg_nsec3_proof_ds(struct val_neg_zone* zone, uint8_t* qname, size_t qname_len,
 	if(!zone->nsec3_hash) 
 		return NULL; /* not nsec3 zone */
 
+	if(!topname && qlabs > zone->labs + 1)
+		return NULL; /* iterator caller; opt-out proof would be discarded
+			     * at the !topname check below anyway.
+			     * The qlabs check allows the exact-match for
+			     * the one-label-below-zone case. */
+
 	if(!(data=neg_find_nsec3_ce(zone, qname, qname_len, qlabs, buf,
 		hashnc, &nclen))) {
 		return NULL;
@@ -1287,7 +1313,7 @@ neg_nsec3_proof_ds(struct val_neg_zone* zone, uint8_t* qname, size_t qname_len,
 			!nsec3_has_type(ce_rrset, 0, LDNS_RR_TYPE_NS))
 			return NULL;
 		if(!(msg = dns_msg_create(qname, qname_len, 
-			LDNS_RR_TYPE_DS, zone->dclass, region, 1))) 
+			LDNS_RR_TYPE_DS, zone->dclass, region, 2))) /* ce + soa */
 			return NULL;
 		/* The cache response means recursion is available. */
 		msg->rep->flags |= BIT_RA;

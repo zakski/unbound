@@ -584,8 +584,11 @@ dns_cache_find_delegation(struct module_env* env, uint8_t* qname,
 			return NULL;
 		}
 	}
-	if(!delegpt_rrset_add_ns(dp, region, nskey, 0))
+	if(!delegpt_rrset_add_ns(dp, region, nskey, 0)) {
+		lock_rw_unlock(&nskey->entry.lock);
 		log_err("find_delegation: addns out of memory");
+		return NULL;
+	}
 	lock_rw_unlock(&nskey->entry.lock); /* first unlock before next lookup*/
 	/* find and add DS/NSEC (if any) */
 	if(msg)
@@ -712,10 +715,16 @@ struct dns_msg*
 dns_msg_deepcopy_region(struct dns_msg* origin, struct regional* region)
 {
 	size_t i;
+	struct ub_packed_rrset_key** saved_rrsets;
 	struct dns_msg* res = NULL;
+	size_t rep_alloc_size = sizeof(struct reply_info)
+		- sizeof(struct rrset_ref);  /* this is the size of res->rep
+						allocated in gen_dns_msg() */
 	res = gen_dns_msg(region, &origin->qinfo, origin->rep->rrset_count);
 	if(!res) return NULL;
-	*res->rep = *origin->rep;
+	saved_rrsets = res->rep->rrsets; /* save rrsets alloc by gen_dns_msg */
+	memcpy(res->rep, origin->rep, rep_alloc_size);
+	res->rep->rrsets = saved_rrsets;
 	if(origin->rep->reason_bogus_str) {
 		res->rep->reason_bogus_str = regional_strdup(region,
 			origin->rep->reason_bogus_str);
@@ -774,11 +783,16 @@ synth_dname_msg(struct ub_packed_rrset_key* rrset, struct regional* region,
 	uint8_t* newname, *dtarg = NULL;
 	size_t newlen, dtarglen;
 	time_t rr_ttl;
+	int graceperiod = 0;
 	if(TTL_IS_EXPIRED(d->ttl, now)) {
 		/* Allow TTL=0 DNAME from upstream within grace period */
 		if(!(rrset->rk.flags & PACKED_RRSET_UPSTREAM_0TTL))
 			return NULL;
 		rr_ttl = 0;
+		/* Since PACKED_RRSET_UPSTREAM_0TTL set the flag that
+		 * the grace period has been applied, this stops the rrset
+		 * from getting stored back into the cache with a bigger TTL.*/
+		graceperiod = 1;
 	} else {
 		rr_ttl = d->ttl - now;
 	}
@@ -806,6 +820,8 @@ synth_dname_msg(struct ub_packed_rrset_key* rrset, struct regional* region,
 	msg->rep->rrsets[0] = packed_rrset_copy_region(rrset, region, now);
 	if(!msg->rep->rrsets[0]) /* copy DNAME */
 		return NULL;
+	if(graceperiod)
+		msg->rep->rrsets[0]->rk.flags |= PACKED_RRSET_0TTL_GRACE;
 	/* synth CNAME rrset */
 	get_cname_target(rrset, &dtarg, &dtarglen);
 	if(!dtarg)

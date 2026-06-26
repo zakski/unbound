@@ -1126,7 +1126,7 @@ make_sock_port(int stype, const char* ifname, int port,
 	int use_systemd, int dscp, struct unbound_socket* ub_sock,
 	const char* additional)
 {
-	char* s = strchr(ifname, '@');
+	const char* s = strchr(ifname, '@');
 	if(s) {
 		/* override port with ifspec@port */
 		int port;
@@ -2167,7 +2167,8 @@ void tcp_req_info_clear(struct tcp_req_info* req)
 	open = req->open_req_list;
 	while(open) {
 		nopen = open->next;
-		mesh_state_remove_reply(open->mesh, open->mesh_state, req->cp);
+		mesh_state_remove_reply(open->mesh, open->mesh_state, req->cp,
+			NULL);
 		free(open);
 		open = nopen;
 	}
@@ -2300,21 +2301,8 @@ int
 tcp_req_info_handle_read_close(struct tcp_req_info* req)
 {
 	verbose(VERB_ALGO, "tcp channel read side closed %d", req->cp->fd);
-	/* reset byte count for (potential) partial read */
-	req->cp->tcp_byte_count = 0;
-	/* if we still have results to write, pick up next and write it */
-	if(req->num_done_req != 0) {
-		tcp_req_pickup_next_result(req);
-		tcp_req_info_setup_listen(req);
-		return 1;
-	}
-	/* if nothing to do, this closes the connection */
-	if(req->num_open_req == 0 && req->num_done_req == 0)
-		return 0;
-	/* otherwise, we must be waiting for dns resolve, wait with timeout */
-	req->read_is_closed = 1;
-	tcp_req_info_setup_listen(req);
-	return 1;
+	/* RFC 7766 6.2.4 says to drop pending replies when client closes. */
+	return 0; /* drop connection */
 }
 
 void
@@ -3638,7 +3626,8 @@ doq_conn_delete(struct doq_conn* conn, struct doq_table* table)
 	lock_rw_unlock(&conn->table->conid_lock);
 	/* Remove the app data from ngtcp2 before SSL_free of conn->ssl,
 	 * because the ngtcp2 conn is deleted. */
-	SSL_set_app_data(conn->ssl, NULL);
+	if(conn->ssl)
+		SSL_set_app_data(conn->ssl, NULL);
 	if(conn->stream_tree.count != 0) {
 		traverse_postorder(&conn->stream_tree, stream_tree_del, table);
 	}
@@ -3780,7 +3769,7 @@ doq_repinfo_retrieve_localaddr(struct comm_reply* repinfo,
 		memset(sa6, 0, *localaddrlen);
 		sa6->sin6_family = AF_INET6;
 		memmove(&sa6->sin6_addr, &repinfo->pktinfo.v6info.ipi6_addr,
-			*localaddrlen);
+			sizeof(struct in6_addr));
 		sa6->sin6_port = repinfo->doq_srcport;
 #endif
 	} else {
@@ -3790,7 +3779,7 @@ doq_repinfo_retrieve_localaddr(struct comm_reply* repinfo,
 		memset(sa, 0, *localaddrlen);
 		sa->sin_family = AF_INET;
 		memmove(&sa->sin_addr, &repinfo->pktinfo.v4info.ipi_addr,
-			*localaddrlen);
+			sizeof(struct in_addr));
 		sa->sin_port = repinfo->doq_srcport;
 #elif defined(IP_RECVDSTADDR)
 		struct sockaddr_in* sa = (struct sockaddr_in*)localaddr;
@@ -4784,7 +4773,7 @@ doq_ssl_server_setup(SSL_CTX* ctx, struct doq_conn* conn)
 	SSL_set_app_data(ssl, conn);
 #endif
 	SSL_set_accept_state(ssl);
-#ifdef USE_NGTCP2_CRYPTO_OSSL
+#ifdef HAVE_SSL_SET_QUIC_TLS_EARLY_DATA_ENABLED
 	SSL_set_quic_tls_early_data_enabled(ssl, 1);
 #else
 	SSL_set_quic_early_data_enabled(ssl, 1);
@@ -4892,6 +4881,7 @@ doq_conn_setup(struct doq_conn* conn, uint8_t* scid, size_t scidlen,
 	rv = ngtcp2_conn_server_new(&conn->conn, &scid_cid, &sv_scid, &path,
 		conn->version, &callbacks, &settings, &params, NULL, conn);
 	if(rv != 0) {
+		conn->conn = NULL;
 		lock_rw_unlock(&conn->table->conid_lock);
 		log_err("ngtcp2_conn_server_new failed: %s",
 			ngtcp2_strerror(rv));
